@@ -1,0 +1,31 @@
+#!/bin/bash
+
+# method check result and exit if bad. checkresult $YOURRESULT 'Error text'
+function checkresult {
+  if [[ $1 -ne "0" ]]; then
+     echo "------------uh-oh----------" >&2
+     echo " Result code $1: $2" >&2
+     echo "xxxxxxxxxxxxxxxxxxxxxxxxxxx" >&2
+     exit $1
+  fi
+}
+
+if [[ -L "/etc/resolv.conf" ]]; then
+  echo "/etc/resolv.conf is a symlink"
+  if [[ -f "/run/systemd/resolve/resolv.conf" ]]; then
+    echo "It is pointing to /run/systemd/resolve/resolv.conf which for many of us can be a really annoying thing..."
+    echo "Deleting symlink"
+    rm -v /etc/resolv.conf
+    checkresult $? "Failed to remove old resolv.conf symlink"
+    echo "Creating new symlink"
+    ln -vs /run/systemd/resolve/resolv.conf /etc/resolv.conf 
+    checkresult $? "Failed to create new resolv.conf symlink, your system may not resolve anything right now"
+    echo "Resolver should be ok now"
+    ls -lF /etc/resolv.conf
+    checkresult $? "Failed to ls resolv.conf, weird, your system may not resolve anything right now"
+  else
+    checkresult 4 "Looks like /run/systemd/resolve/resolv.conf does not exist? systemd-resolve is not installed it seems. You need to fix /etc/resolv.conf manually"
+  fi
+else
+  echo "/etc/resolv.conf is not a symlink, so did not change anything. Make sure you have proper resolve"
+fi
