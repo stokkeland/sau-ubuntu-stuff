@@ -1,5 +1,10 @@
 #!/bin/bash
 
+# This lazy script changes the symlink from the SR system resolver, which to me is often an annoying things that screws up local dns and stuff that should resolve
+# the correct way is probably to edit /etc/systemd/resolved.conf or other means to fix the SR
+# this script just does a dirty change of symlink - and you can now "trust" your applications to use whatever you put in there
+# as long as that is not 127.0.0.1 
+
 # method check result and exit if bad. checkresult $YOURRESULT 'Error text'
 function checkresult {
   if [[ $1 -ne "0" ]]; then
