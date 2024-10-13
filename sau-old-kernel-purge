@@ -1,0 +1,136 @@
+#!/bin/bash
+
+# Sau old Kernel Purge
+#
+# FKA Sau Fix Kernels Installed (old names saufixkernel, saupurgekernel) - originally from separate github repo, moved into sau-ubuntu-stuff October 2024.
+#
+# Version 2024-10-11
+# (c) Thomas Stokkeland 2022-2024  stokkeland@gmail.com
+# A simple/dirty script to attempt removing old kernels
+# MIT license - Please see file LICENSE
+# Git Repo https://github.com/stokkeland/sau-ubuntu-stuff/
+#
+# No guarantees, use at own risk for testing only, never use in production environment
+# If you are thinking of actually running this, ALWAYS do list first before purge
+#
+# Originally written for Ubuntu 22.04 LTS
+#  has been tested on Ubuntu 20.04 LTS and appears fine there, just need to change that
+#  variable below - or if you dare, remove the check of version
+#
+# This is bloated and not ver elegant, it started as a simple list and evolved a bit at 
+# the time over the years, feel free to sunmit elegance updates/pull-req
+#
+# What prompted this is how many people keeps on posting something that you can simply
+# do autoremove with purge, i found this never really works...
+# Some argued we should check for ii vs rc, personally i want to purge it all, so if
+# want to add options for remove and purge separated and based on installed/configured
+# mode then please develop this and submit a pull request.
+
+
+function checkresult {
+  if [[ $1 -ne "0" ]]; then
+     echo "--Script-aborted--------------------------" >&2
+     echo " Result $1: $2" >&2
+     exit $1
+  fi
+}
+
+function showusage {
+  echo "Command/Argument errors" >&2
+  echo "This command by default lists or purges all kernels that are not active (Make sure to reboot and be on the one to keep)" >&2
+  echo "Parameter 1 is required to be list or purge" >&2
+  echo "parameter 2 is optional, if supplied it is used to match a non-active linux release that should NOT be purged," >&2
+  echo "            parameter is supplied to egrep, so you can 'or' it with | to match multiple, this is used to" >&2
+  echo "            exclude non-active installed kernels from purging. Examples:" >&2
+  echo "               '5.15.0-91-generic$|5.15.0-91-lowlatency$'" >&2
+  echo "               '5.15.0-91-'" >&2
+  echo "Usage: $0 <list|purge> [<exclude-suffix>]"
+  echo "Examples:" >&2
+  echo " saupurgekernel list" >&2
+  echo " saupurgekernel list '5.15.0-91-generic$'" >&2
+  echo " saupurgekernel purge" >&2
+  echo " saupurgekernel purge '5.15.0-91-generic$'" >&2
+
+  checkresult "$1" "$2"
+}
+
+if [ $# -eq 0 ]; then
+   showusage 2 'Missing arguments'
+fi
+
+MYCMD=$1
+if [ -z "$MYCMD" ]; then 
+   showusage 2 'Argument 1 cannot be empty'
+fi
+if [[ "$MYCMD" != "list" && "$MYCMD" != "purge" ]]; then
+   showusage 3 'Argument 1 is incorrect'
+fi
+
+MYEXCLUDE=$2
+
+if [ $# -gt 2 ]; then
+   showusage 4 'Too many arguments'
+fi
+
+
+. /etc/lsb-release
+checkresult $? 'Failed to source lsb-release'
+
+SCRIPT_FOR_OS='Ubuntu'
+SCRIPT_FOR_OS_RELEASE='22.04'
+# TODO make a list of supported ones, pretty sure its ok on 18, 20, 22, and 24 - but not officially QA'd.
+
+if [ "$DISTRIB_ID" != "$SCRIPT_FOR_OS" ]; then 
+  checkresult 3 "Running OS appears to be '$DISTRIB_ID' and does not match required '$SCRIPT_FOR_OS'"
+fi
+
+if [ "$DISTRIB_RELEASE" != "$SCRIPT_FOR_OS_RELEASE" ]; then 
+  checkresult 3 "Running OS version appears to be '$DISTRIB_RELEASE' and does not match required '$SCRIPT_FOR_OS_RELEASE'"
+fi
+
+MYKERNEL=`uname -r`
+checkresult $? 'Failed to get current running kernel with uname'
+
+MYKEEPMATCH="-$MYKERNEL"'$'
+
+# MYPKGMATCH='(linux-image|linux-headers|linux-modules)-[0-9]+\.[0-9]+\.[0-9]+'
+
+MYPKGMATCH='(linux-image|linux-modules)-[0-9]+\.[0-9]+\.[0-9]+'
+mapfile -t MYKEEP < <(dpkg -l | awk '{ print $2 }' | egrep "$MYPKGMATCH" | egrep -- "$MYKEEPMATCH" )
+
+if [ ${#MYKEEP[@]} -eq 0 ]; then
+   checkresult 1 'Unable to match running kernel to any installed package'
+fi
+
+if [ -z "$MYEXCLUDE" ]; then 	
+  mapfile -t MYINST < <(dpkg -l | awk '{ print $2 }' | egrep "$MYPKGMATCH" | egrep -v -- "$MYKEEPMATCH")
+else
+  mapfile -t MYINST < <(dpkg -l | awk '{ print $2 }' | egrep "$MYPKGMATCH" | egrep -v -- "$MYKEEPMATCH" | egrep -v -- "$MYEXCLUDE")
+  mapfile -t -O "${#MYKEEP[@]}" MYKEEP < <(dpkg -l | awk '{ print $2 }' | egrep "$MYPKGMATCH" | egrep -- "$MYEXCLUDE")
+fi
+
+echo "Active now: $DISTRIB_ID $DISTRIB_RELEASE $MYKERNEL"
+
+if [ "$MYCMD" = "list" ]; then
+  echo "#--- Listing of what To Purge ---"
+  printf "%s\n" "${MYINST[@]}"
+  echo "#--- End List of what to Purge ---"
+  echo ""
+  echo "#--- Listing of what will be Excluded from purge ---"
+  printf "%s\n" "${MYKEEP[@]}"
+  echo "#--- End List of what will be Excluded from purge ---"
+
+elif [ "$MYCMD" = "purge" ]; then
+  echo "#--- Listing of what is Excluded from purge ---"
+  printf "%s\n" "${MYKEEP[@]}"
+  echo "#--- End List of what is Excluded from purge ---"
+
+  if [ ${#MYINST[@]} -eq 0 ]; then
+     checkresult 0 'Nothing to purge, nothing to do, exiting on a positive note'
+  fi
+
+  printf "%s " "${MYINST[@]}" | xargs apt -y purge
+
+else
+  checkresult 1 'This should not happen - error in command selection'
+fi
