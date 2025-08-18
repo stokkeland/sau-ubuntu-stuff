@@ -26,6 +26,9 @@
 # want to add options for remove and purge separated and based on installed/configured
 # mode then please develop this and submit a pull request.
 
+# Feature needed:
+# Check dpkg for what is installed, and also remove headers
+
 
 function checkresult {
   if [[ $1 -ne "0" ]]; then
