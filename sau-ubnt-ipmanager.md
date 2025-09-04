@@ -39,7 +39,9 @@ networking and switch from dhcp to static or vice versa, for any system with a s
 - To set/keep dhcp after install, remove cloud init:
   - `sau-ubnt-ipmanager --dhcp --clean-cloud-init`
 - To set static and remove cloud init network config:
-  - `sau-ubnt-ipmanager --static 10.38.73.249/25 --gateway 10.38.73.129 --nameservers 10.5.100.9 --clean-cloud-init`
+  - `sau-ubnt-ipmanager --static 10.38.73.249/25 --gateway 10.38.73.129 --nameservers 10.5.100.9,10.5.100.10 --clean-cloud-init`
+- When you already removed cloud init and just need to change static ip:
+  - `sau-ubnt-ipmanager --static 10.38.73.102/25 --gateway 10.38.73.129 --nameservers 10.5.100.9,10.5.100.10`
 
 ## Features
 
