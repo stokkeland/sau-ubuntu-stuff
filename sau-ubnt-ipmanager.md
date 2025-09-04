@@ -417,12 +417,8 @@ Before configuring static IP:
 
 ## License
 
+MIT License, see separate licence file for details.
 This tool is provided as-is for managing Ubuntu network configurations. Use at your own risk and always maintain proper backups.
 
-## Support
-
-For issues, questions, or contributions, please contact your system administrator or refer to the Ubuntu Netplan documentation at https://netplan.io/
-
 ---
-
 *Last updated: Documentation reflects sau-ubnt-ipmanager version as of script creation date*
