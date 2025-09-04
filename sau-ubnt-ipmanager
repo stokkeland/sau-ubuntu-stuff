@@ -1,0 +1,483 @@
+#!/bin/bash
+
+# sau-ubnt-ipmanager - Ubuntu 22.04 LTS Network Configuration Manager
+# Was created for Ubuntu 22.04 but seems to work fine on Ubuntu 24 as well
+# it is made for netplan basically, the annoying cloud-init default stuff that install does
+# just a quicker way to disable cloud-init networking and switch from dhcp to static or vice versa
+# for any system with a single interface
+
+# see sau-ubnt-ipmanager.md for documenation or use -h for usage.
+
+# My most common uses:
+# To set/keep dhcp after install, remove cloud init:
+#   sau-ubnt-ipmanager --dhcp --clean-cloud-init
+# To set static and remove cloud init:
+#   sau-ubnt-ipmanager --static 10.38.73.249/24 --gateway 10.38.73.129 --nameservers 10.42.194.10 --clean-cloud-init
+
+# (c) Thomas Stokkeland 2025. Partially made with Claude. MIT License 
+
+# Exit codes:
+# 0 - Success
+# 1 - General error
+# 2 - Not netplan managed
+# 3 - Invalid arguments
+# 4 - Permission denied
+# 5 - SSH warning abort
+
+set -e
+set -o pipefail
+
+# Colors for output
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+NC='\033[0m' # No Color
+
+# Configuration
+NETPLAN_DIR="/etc/netplan"
+BACKUP_DIR="${NETPLAN_DIR}/backups"
+CONFIG_FILE="${NETPLAN_DIR}/01-network-config.yaml"
+CLOUD_CONFIG="/etc/cloud/cloud.cfg"
+
+# Function to print errors to stderr and exit
+error_exit() {
+    echo -e "${RED}ERROR: $1${NC}" >&2
+    exit "${2:-1}"
+}
+
+# Function to print warnings
+warning() {
+    echo -e "${YELLOW}WARNING: $1${NC}" >&2
+}
+
+# Function to print success messages
+success() {
+    echo -e "${GREEN}SUCCESS: $1${NC}"
+}
+
+# Check if running as root
+check_root() {
+    if [[ $EUID -ne 0 ]]; then
+        error_exit "This script must be run as root" 4
+    fi
+}
+
+# Check if system is netplan managed
+check_netplan() {
+    if ! command -v netplan &> /dev/null; then
+        error_exit "Netplan is not installed on this system" 2
+    fi
+    
+    if [[ ! -d "$NETPLAN_DIR" ]]; then
+        error_exit "Netplan directory does not exist: $NETPLAN_DIR" 2
+    fi
+    
+    # Check if there are any yaml files in netplan directory
+    if ! ls "$NETPLAN_DIR"/*.yaml &> /dev/null && ! ls "$NETPLAN_DIR"/*.yml &> /dev/null; then
+        warning "No netplan configuration files found, but netplan is installed"
+    fi
+}
+
+# Check if connected via SSH
+check_ssh_connection() {
+    if [[ -n "${SSH_CONNECTION}" || -n "${SSH_CLIENT}" || -n "${SSH_TTY}" ]]; then
+        return 0
+    fi
+    return 1
+}
+
+# Create backup directory
+create_backup_dir() {
+    if [[ ! -d "$BACKUP_DIR" ]]; then
+        mkdir -p "$BACKUP_DIR" || error_exit "Failed to create backup directory: $BACKUP_DIR" 1
+    fi
+}
+
+# Backup a file
+backup_file() {
+    local file="$1"
+    local timestamp=$(date +%Y%m%d_%H%M%S)
+    local filename=$(basename "$file")
+    local backup_path="${BACKUP_DIR}/${filename}.${timestamp}"
+    
+    if [[ -f "$file" ]]; then
+        cp -p "$file" "$backup_path" || error_exit "Failed to backup file: $file" 1
+        echo "Backed up: $file -> $backup_path"
+    fi
+}
+
+# Get primary network interface
+get_primary_interface() {
+    local interface
+    # Try to get the default route interface
+    interface=$(ip route show default | awk '/default/ {print $5}' | head -n1)
+    
+    # If no default route, get first non-loopback interface
+    if [[ -z "$interface" ]]; then
+        interface=$(ip -o link show | awk -F': ' '{print $2}' | grep -v lo | head -n1)
+    fi
+    
+    echo "$interface"
+}
+
+# Get MAC address for interface
+get_mac_address() {
+    local interface="$1"
+    ip link show "$interface" | awk '/link\/ether/ {print $2}'
+}
+
+# Validate IP address
+validate_ip() {
+    local ip="$1"
+    if [[ ! "$ip" =~ ^[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}$ ]]; then
+        return 1
+    fi
+    
+    local IFS='.'
+    local -a octets=($ip)
+    for octet in "${octets[@]}"; do
+        if (( octet > 255 )); then
+            return 1
+        fi
+    done
+    
+    return 0
+}
+
+# Validate CIDR notation
+validate_cidr() {
+    local cidr="$1"
+    local ip="${cidr%/*}"
+    local prefix="${cidr#*/}"
+    
+    if ! validate_ip "$ip"; then
+        return 1
+    fi
+    
+    if [[ ! "$prefix" =~ ^[0-9]+$ ]] || (( prefix > 32 || prefix < 0 )); then
+        return 1
+    fi
+    
+    return 0
+}
+
+# Remove cloud-init network configuration
+remove_cloud_init() {
+    echo "Removing cloud-init network configuration..."
+
+    # Backup and modify cloud.cfg
+    if [[ -f "$CLOUD_CONFIG" ]]; then
+        backup_file "$CLOUD_CONFIG"
+
+        # Disable any existing "network:" section (but not comments)
+        if grep -qE '^[[:space:]]*network:' "$CLOUD_CONFIG"; then
+            sed -i 's/^[[:space:]]*network:/#&/' "$CLOUD_CONFIG"
+        fi
+
+        # Add network disabled flag if not present (ignore comments)
+        if ! grep -qE '^[[:space:]]*network:[[:space:]]*\{config:[[:space:]]*disabled\}' "$CLOUD_CONFIG"; then
+            echo "network: {config: disabled}" >> "$CLOUD_CONFIG"
+        fi
+
+        success "Cloud-init network configuration disabled"
+    fi
+
+    # Remove cloud-init generated netplan files
+    local files_to_remove=(
+        "${NETPLAN_DIR}/50-cloud-init.yaml"
+        "${NETPLAN_DIR}/70-netplan-set.yaml"
+    )
+
+    for file in "${files_to_remove[@]}"; do
+        if [[ -f "$file" ]]; then
+            backup_file "$file"
+            rm -f "$file"
+            echo "Removed: $file"
+        fi
+    done
+
+    # Remove all other yaml files except our config file
+    for file in "$NETPLAN_DIR"/*.yaml "$NETPLAN_DIR"/*.yml; do
+        if [[ -f "$file" && "$file" != "$CONFIG_FILE" ]]; then
+            backup_file "$file"
+            rm -f "$file"
+            echo "Removed: $file"
+        fi
+    done
+}
+
+# Create DHCP configuration
+create_dhcp_config() {
+    local interface="$1"
+    local mac_address="$2"
+    
+    cat > "$CONFIG_FILE" << EOF
+# Generated by sau-ubnt-ipmanager
+# Date: $(date)
+network:
+  version: 2
+  renderer: networkd
+  ethernets:
+    ${interface}:
+      dhcp4: true
+      dhcp-identifier: mac
+      match:
+        macaddress: ${mac_address}
+      set-name: ${interface}
+EOF
+    
+    success "DHCP configuration created for interface: $interface (MAC: $mac_address)"
+}
+
+# Create static IP configuration
+create_static_config() {
+    local interface="$1"
+    local ip_cidr="$2"
+    local gateway="$3"
+    local nameservers="$4"
+    
+    # Format nameservers for YAML
+    local ns_yaml=""
+    IFS=',' read -ra NS_ARRAY <<< "$nameservers"
+    for ns in "${NS_ARRAY[@]}"; do
+        ns_yaml="${ns_yaml}        - ${ns}\n"
+    done
+    
+    cat > "$CONFIG_FILE" << EOF
+# Generated by sau-ubnt-ipmanager
+# Date: $(date)
+network:
+  version: 2
+  renderer: networkd
+  ethernets:
+    ${interface}:
+      dhcp4: false
+      addresses:
+        - ${ip_cidr}
+      routes:
+        - to: default
+          via: ${gateway}
+      nameservers:
+        addresses:
+$(echo -e "$ns_yaml" | sed 's/$//')
+EOF
+    
+    success "Static IP configuration created:"
+    echo "  Interface: $interface"
+    echo "  IP/CIDR: $ip_cidr"
+    echo "  Gateway: $gateway"
+    echo "  Nameservers: $nameservers"
+}
+
+# Apply netplan configuration
+apply_netplan() {
+    echo "Applying netplan configuration..."
+    
+    # First try to generate the configuration
+    if ! netplan generate 2>&1; then
+        error_exit "Failed to generate netplan configuration" 1
+    fi
+    
+    # Then apply it
+    if ! netplan apply 2>&1; then
+        error_exit "Failed to apply netplan configuration" 1
+    fi
+    
+    success "Netplan configuration applied successfully"
+}
+
+# Show usage
+usage() {
+    cat << EOF
+Usage: $0 [OPTIONS]
+
+Ubuntu 22.04 LTS Network Configuration Manager
+
+OPTIONS:
+    -d, --dhcp                  Configure DHCP (uses MAC as identifier)
+    -s, --static IP/CIDR        Configure static IP (requires -g and -n)
+    -g, --gateway GATEWAY       Gateway for static IP configuration
+    -n, --nameservers DNS1,DNS2 Comma-separated list of nameservers
+    -i, --interface IFACE       Specify network interface (auto-detect if not specified)
+    -c, --clean-cloud-init      Remove cloud-init network configuration
+    -a, --apply                 Apply configuration immediately
+    -h, --help                  Show this help message
+
+EXAMPLES:
+    Configure DHCP:
+        $0 --dhcp
+        $0 -d -i eth0
+
+    Configure Static IP:
+        $0 --static 192.168.1.100/24 --gateway 192.168.1.1 --nameservers 8.8.8.8,8.8.4.4
+        $0 -s 10.0.0.50/24 -g 10.0.0.1 -n 1.1.1.1,1.0.0.1 -i enp0s3
+
+    Remove cloud-init and configure DHCP:
+        $0 --clean-cloud-init --dhcp
+
+    Configure and apply immediately:
+        $0 --dhcp --apply
+
+EXIT CODES:
+    0 - Success
+    1 - General error
+    2 - Not netplan managed
+    3 - Invalid arguments
+    4 - Permission denied
+    5 - SSH warning abort
+
+EOF
+}
+
+# Main function
+main() {
+    local mode=""
+    local ip_cidr=""
+    local gateway=""
+    local nameservers=""
+    local interface=""
+    local clean_cloud=false
+    local apply=false
+    
+    # Parse arguments
+    while [[ $# -gt 0 ]]; do
+        case $1 in
+            -d|--dhcp)
+                mode="dhcp"
+                shift
+                ;;
+            -s|--static)
+                mode="static"
+                ip_cidr="$2"
+                shift 2
+                ;;
+            -g|--gateway)
+                gateway="$2"
+                shift 2
+                ;;
+            -n|--nameservers)
+                nameservers="$2"
+                shift 2
+                ;;
+            -i|--interface)
+                interface="$2"
+                shift 2
+                ;;
+            -c|--clean-cloud-init)
+                clean_cloud=true
+                shift
+                ;;
+            -a|--apply)
+                apply=true
+                shift
+                ;;
+            -h|--help)
+                usage
+                exit 0
+                ;;
+            *)
+                error_exit "Unknown option: $1\nUse -h for help" 3
+                ;;
+        esac
+    done
+    
+    # Validate arguments
+    if [[ -z "$mode" ]]; then
+        error_exit "No mode specified. Use -d for DHCP or -s for static IP\nUse -h for help" 3
+    fi
+    
+    if [[ "$mode" == "static" ]]; then
+        if [[ -z "$ip_cidr" ]]; then
+            error_exit "Static IP mode requires IP/CIDR notation" 3
+        fi
+        
+        if ! validate_cidr "$ip_cidr"; then
+            error_exit "Invalid IP/CIDR notation: $ip_cidr" 3
+        fi
+        
+        if [[ -z "$gateway" ]]; then
+            error_exit "Static IP mode requires gateway (-g)" 3
+        fi
+        
+        if ! validate_ip "$gateway"; then
+            error_exit "Invalid gateway IP: $gateway" 3
+        fi
+        
+        if [[ -z "$nameservers" ]]; then
+            error_exit "Static IP mode requires nameservers (-n)" 3
+        fi
+        
+        # Validate each nameserver
+        IFS=',' read -ra NS_ARRAY <<< "$nameservers"
+        for ns in "${NS_ARRAY[@]}"; do
+            if ! validate_ip "$ns"; then
+                error_exit "Invalid nameserver IP: $ns" 3
+            fi
+        done
+    fi
+    
+    # Check prerequisites
+    check_root
+    check_netplan
+    
+    # Get interface if not specified
+    if [[ -z "$interface" ]]; then
+        interface=$(get_primary_interface)
+        if [[ -z "$interface" ]]; then
+            error_exit "Could not determine primary network interface. Please specify with -i" 1
+        fi
+        echo "Auto-detected interface: $interface"
+    fi
+    
+    # Verify interface exists
+    if ! ip link show "$interface" &> /dev/null; then
+        error_exit "Interface does not exist: $interface" 1
+    fi
+    
+    # Create backup directory
+    create_backup_dir
+    
+    # Clean cloud-init if requested
+    if [[ "$clean_cloud" == true ]]; then
+        remove_cloud_init
+    fi
+    
+    # Backup existing configuration
+    if [[ -f "$CONFIG_FILE" ]]; then
+        backup_file "$CONFIG_FILE"
+    fi
+    
+    # Create new configuration
+    if [[ "$mode" == "dhcp" ]]; then
+        local mac_address=$(get_mac_address "$interface")
+        if [[ -z "$mac_address" ]]; then
+            error_exit "Could not determine MAC address for interface: $interface" 1
+        fi
+        create_dhcp_config "$interface" "$mac_address"
+    elif [[ "$mode" == "static" ]]; then
+        create_static_config "$interface" "$ip_cidr" "$gateway" "$nameservers"
+    fi
+    
+    # Apply configuration if requested
+    if [[ "$apply" == true ]]; then
+        if check_ssh_connection; then
+            warning "You are connected via SSH!"
+            echo "Applying network configuration may disconnect your session."
+            echo -n "Do you want to continue? (yes/no): "
+            read -r response
+            
+            if [[ "$response" != "yes" ]]; then
+                error_exit "Configuration saved but not applied. Run 'netplan apply' manually or reboot." 5
+            fi
+        fi
+        
+        apply_netplan
+    else
+        success "Configuration saved but not applied."
+        echo "To apply changes, run: netplan apply"
+        echo "Or reboot the system for changes to take effect."
+    fi
+}
+
+# Run main function
+main "$@"
